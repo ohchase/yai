@@ -1,22 +1,25 @@
 use clap::Parser;
+use std::ffi::c_void;
 use sysinfo::{Pid, PidExt, ProcessExt, System, SystemExt};
 use thiserror::Error;
-use winapi::{
-    ctypes::c_void,
-    shared::minwindef::{FALSE, HMODULE},
-    um::{
-        handleapi::CloseHandle,
-        libloaderapi::{GetModuleHandleA, GetProcAddress},
-        memoryapi::{VirtualAllocEx, VirtualFreeEx, WriteProcessMemory},
-        processthreadsapi::{CreateRemoteThread, OpenProcess},
-        synchapi::WaitForSingleObject,
-        winbase::INFINITE,
-        winnt::{
-            HANDLE, MEM_COMMIT, MEM_DECOMMIT, PAGE_READWRITE, PROCESS_CREATE_THREAD,
-            PROCESS_VM_OPERATION, PROCESS_VM_WRITE,
+use windows_sys::{
+    core::PCSTR,
+    s,
+    Win32::{
+        Foundation::{CloseHandle, FALSE, HANDLE, HMODULE},
+        System::{
+            Diagnostics::Debug::WriteProcessMemory,
+            LibraryLoader::{GetModuleHandleA, GetProcAddress},
+            Memory::{VirtualAllocEx, VirtualFreeEx, MEM_COMMIT, MEM_DECOMMIT, PAGE_READWRITE},
+            Threading::{
+                CreateRemoteThread, OpenProcess, WaitForSingleObject, INFINITE,
+                PROCESS_CREATE_THREAD, PROCESS_VM_OPERATION, PROCESS_VM_WRITE,
+            },
         },
     },
 };
+
+type LoadLibraryA = unsafe extern "system" fn(lplibfilename: PCSTR) -> HMODULE;
 
 #[macro_use]
 extern crate log;
@@ -64,28 +67,29 @@ struct Args {
 
 struct ContextedRemoteThread<'process> {
     _process: &'process RawProcess,
-    thread: *mut c_void,
+    thread: HANDLE,
 }
 
 impl<'process> ContextedRemoteThread<'process> {
     fn spawn_with_args(
         process: &'process RawProcess,
         allocation: &'process RawAllocation,
-        entry_function: unsafe extern "system" fn(*mut c_void) -> u32,
+        entry_function: LoadLibraryA,
     ) -> Result<Self, InjectorError> {
         let thread = unsafe {
             CreateRemoteThread(
                 process.inner(),
                 std::ptr::null_mut(),
                 0,
-                Some(entry_function),
+                // Transmute from 'fn (*const u8) -> isize' to 'fn(*mut c_void) -> u32'.
+                Some(std::mem::transmute(entry_function)),
                 allocation.inner(),
                 0,
                 std::ptr::null_mut(),
             )
         };
 
-        if thread.is_null() {
+        if thread == 0 {
             return Err(InjectorError::RemoteThread());
         }
 
@@ -149,7 +153,7 @@ impl<'process> RawAllocation<'process> {
 
     fn spawn_thread_with_args(
         &self,
-        entry_function: unsafe extern "system" fn(*mut c_void) -> u32,
+        entry_function: LoadLibraryA,
     ) -> Result<ContextedRemoteThread, InjectorError> {
         ContextedRemoteThread::spawn_with_args(self.process, self, entry_function)
     }
@@ -213,7 +217,7 @@ impl RawProcess {
             )
         };
 
-        if handle.is_null() {
+        if handle == 0 {
             return Err(InjectorError::ProcessOpen());
         }
 
@@ -244,26 +248,20 @@ impl Drop for RawProcess {
 }
 
 fn get_kernel_module() -> Result<HMODULE, InjectorError> {
-    let kernel_module = unsafe { GetModuleHandleA("kernel32.dll\0".as_ptr() as *const i8) };
+    let kernel_module = unsafe { GetModuleHandleA(s!("kernel32.dll")) };
 
-    if kernel_module.is_null() {
+    if kernel_module == 0 {
         return Err(InjectorError::KernelModule());
     }
 
     Ok(kernel_module)
 }
 
-fn get_load_library_proc(
-    kernel_module: HMODULE,
-) -> Result<unsafe extern "system" fn(*mut c_void) -> u32, InjectorError> {
-    let load_library_proc =
-        unsafe { GetProcAddress(kernel_module, "LoadLibraryA\0".as_ptr() as *const i8) };
-    if load_library_proc.is_null() {
-        return Err(InjectorError::LoadLibraryProc());
-    }
+fn get_load_library_proc(kernel_module: HMODULE) -> Result<LoadLibraryA, InjectorError> {
+    let load_library_proc = unsafe { GetProcAddress(kernel_module, s!("LoadLibraryA")) }
+        .ok_or(InjectorError::LoadLibraryProc())?;
 
-    let load_library_proc: unsafe extern "system" fn(*mut c_void) -> u32 =
-        unsafe { std::mem::transmute(load_library_proc) };
+    let load_library_proc: LoadLibraryA = unsafe { std::mem::transmute(load_library_proc) };
 
     Ok(load_library_proc)
 }
