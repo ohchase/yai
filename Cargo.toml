@@ -6,10 +6,16 @@ description = "Yet Another Injector for windows x64 dlls."
 repository = "https://github.com/0xFounders/yai"
 license = "MIT"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[[bin]]
+name = "yai"
+required-features = ["cli"]
+
+[features]
+default = ["cli"]
+cli = ["clap"]
 
 [dependencies]
-clap = { version = "4.0.15", features = ["derive"] }
+clap = { version = "4.0.15", features = ["derive"], optional = true }
 log = "0.4.17"
 pretty_env_logger = "0.4.0"
 thiserror = "1.0.32"
